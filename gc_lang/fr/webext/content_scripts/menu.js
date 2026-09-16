@@ -81,6 +81,18 @@ class GrammalecteButton {
         this.xButton.style.display = "none";
     }
 
+    scheduleAutoCheck () {
+        // Called after examineNode(), on click and keyup. Pour les zones de texte
+        // enrichi (contentEditable), on souligne directement les erreurs dans le
+        // texte réel (voir inline_checker.js), sans ouvrir le panneau Grammalecte.
+        // Pour les <textarea>/<input>/<iframe>, pas de vérification automatique
+        // pour l'instant (il faut toujours le clic droit ou le bouton perle) :
+        // le soulignage en place n'est pas encore géré pour ces éléments.
+        if (this.xTextNode && this.xTextNode.isContentEditable) {
+            oInlineChecker.scheduleCheck(this.xTextNode);
+        }
+    }
+
     move () {
         if (this.xTextNode) {
             let oCoord = oGrammalecte.getElementCoord(this.xTextNode);

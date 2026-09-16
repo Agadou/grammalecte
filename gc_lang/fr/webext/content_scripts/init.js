@@ -76,10 +76,12 @@ const oGrammalecte = {
         document.addEventListener("click", (xEvent) => {
             //console.log("click", xEvent.target.id);
             this.oPanelButton.examineNode(xEvent.target);
+            this.oPanelButton.scheduleAutoCheck();
         });
         document.addEventListener("keyup", (xEvent) => {
             //console.log("keyup", document.activeElement.id);
             this.oPanelButton.examineNode(document.activeElement);
+            this.oPanelButton.scheduleAutoCheck();
         });
         // Node where a right click is done
         // Bug report: https://bugzilla.mozilla.org/show_bug.cgi?id=1325814
