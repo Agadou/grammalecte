@@ -23,6 +23,18 @@
       seul au prochain cycle.
 */
 
+/*
+    Catégories de règles typographiques (voir gc_lang/fr/rules.grx, OPTLABEL/*)
+    considérées comme suffisamment sûres pour une correction automatique :
+    des substitutions déterministes (apostrophe courbe, espaces surnuméraires
+    ou insécables, ligatures...), jamais une question de contexte/sens. Les
+    catégories marquées [!] dans rules.grx (beaucoup de faux positifs, comme
+    "ocr" ou "mapos") sont volontairement exclues, de même que tout ce qui
+    touche à l'accord/la conjugaison/le style (jamais une certitude comparable
+    à une coquille typographique).
+*/
+const TYPO_AUTOCORRECT_OPTIONS = new Set(["apos", "typo", "esp", "tab", "nbsp", "num", "unit", "liga"]);
+
 const oInlineChecker = {
 
     nNextId: 0,
@@ -31,6 +43,9 @@ const oInlineChecker = {
 
     xMenu: null,
     oIgnoredWords: null, // Set, chargé une fois depuis browser.storage.local (clé partagée avec le panneau : "ignored_words")
+
+    nNextAutoCorrectKey: 0,
+    oAutoCorrectPending: new Map(), // clé -> { xNode, xRange, oErr, aSugg, nTimer }
 
     _getState (xNode) {
         if (!this.oState.has(xNode)) {
@@ -97,7 +112,11 @@ const oInlineChecker = {
                 }
             }
             else if (oData.sType === "spellsugg") {
-                this._onSpellSugg(xNode, oData.oResult);
+                if (oData.oInfo && oData.oInfo.sErrorId && oData.oInfo.sErrorId.startsWith("autocorrect:")) {
+                    this._onAutoCorrectSugg(oData.oInfo.sErrorId.slice(12), oData.oResult);
+                } else {
+                    this._onSpellSugg(xNode, oData.oResult);
+                }
             }
         }
         catch (e) {
@@ -181,6 +200,11 @@ const oInlineChecker = {
         for (let oPara of oData.aPendingResults) {
             let nBase = oData.aParaStart[oPara.iParaNum] || 0;
             for (let oErr of oPara.aGrammErr) {
+                if (this._tryTypoAutoCorrect(xNode, nBase + oErr.nStart, nBase + oErr.nEnd, oErr)) {
+                    // le texte a changé : les décalages du reste de cette passe ne sont
+                    // plus fiables, on arrête là — une analyse fraîche a été programmée.
+                    return;
+                }
                 this._addHighlight(xNode, nBase + oErr.nStart, nBase + oErr.nEnd, oErr, "grammar");
             }
             for (let oErr of oPara.aSpellErr) {
@@ -190,6 +214,54 @@ const oInlineChecker = {
                 this._addHighlight(xNode, nBase + oErr.nStart, nBase + oErr.nEnd, oErr, "spelling");
             }
         }
+    },
+
+    // Corrections typographiques déterministes (voir TYPO_AUTOCORRECT_OPTIONS) :
+    // contrairement à l'orthographe, la suggestion est déjà fournie avec l'erreur,
+    // pas besoin d'aller la chercher. Retourne true si la correction a été appliquée.
+    _tryTypoAutoCorrect (xNode, nStart, nEnd, oErr) {
+        if (!TYPO_AUTOCORRECT_OPTIONS.has(oErr.sType) || !oErr.aSuggestions || oErr.aSuggestions.length !== 1) {
+            return false;
+        }
+        let xRange = this._buildRange(xNode, nStart, nEnd);
+        if (!xRange) {
+            return false;
+        }
+        this._applyAutoCorrection(xNode, xRange, nStart, nEnd, oErr.aSuggestions[0]);
+        return true;
+    },
+
+    // Remplace le texte de <xRange> (couvrant [nStart, nEnd[ dans le texte aplati
+    // courant de <xNode>) par <sNewText>, en conservant la position du curseur s'il
+    // s'y trouvait, puis reprogramme une analyse fraîche (les décalages ont changé).
+    _applyAutoCorrection (xNode, xRange, nStart, nEnd, sNewText) {
+        let oState = this._getState(xNode);
+        let nOldCaret = this._getGlobalCaretOffset(xNode, oState.aCharMap);
+        let bWasFocused = (document.activeElement === xNode) || xNode.contains(this._getSelectionNode());
+        try {
+            xRange.deleteContents();
+            xRange.insertNode(document.createTextNode(sNewText));
+        }
+        catch (e) {
+            showError(e);
+            return;
+        }
+        let { aCharMap, aParaStart } = this._extractTextAndMap(xNode);
+        oState.aCharMap = aCharMap;
+        oState.aParaStart = aParaStart;
+        if (bWasFocused && nOldCaret >= 0) {
+            let nDelta = sNewText.length - (nEnd - nStart);
+            let nNewCaret;
+            if (nOldCaret >= nEnd) {
+                nNewCaret = nOldCaret + nDelta;
+            } else if (nOldCaret >= nStart) {
+                nNewCaret = nStart + sNewText.length;
+            } else {
+                nNewCaret = nOldCaret;
+            }
+            this._setGlobalCaretOffset(xNode, aCharMap, nNewCaret);
+        }
+        this.scheduleCheck(xNode);
     },
 
     _buildRange (xNode, nStart, nEnd) {
@@ -225,9 +297,131 @@ const oInlineChecker = {
         if (!xRange) {
             return;
         }
-        let oHighlight = { xNode, xRange, oErr, sKind, aDivs: [] };
+        let oHighlight = { xNode, xRange, nStart, nEnd, oErr, sKind, aDivs: [] };
         this._getState(xNode).aHighlights.push(oHighlight);
         this._repositionHighlight(oHighlight);
+        if (sKind === "spelling") {
+            this._checkAutoCorrect(oHighlight);
+        }
+    },
+
+    /*
+        Auto-correction : uniquement pour les mots inconnus du dictionnaire dont
+        LA SEULE proposition qui ne diffère du mot tapé que par des accents
+        (ex. "cinema" -> "cinéma", "epouvantail" -> "épouvantail"). C'est le seul
+        cas où l'orthographe correcte est certaine sans ambiguïté — si plusieurs
+        graphies accentuées différentes sont possibles (ex. plusieurs mots
+        existent selon les accents), ou si la correction change autre chose que
+        des accents, on ne touche à rien et on laisse le soulignage + le clic
+        droit habituels. Les erreurs de grammaire ne sont jamais auto-corrigées :
+        ce sont des suggestions contextuelles, jamais une certitude comparable.
+    */
+    _stripAccents (s) {
+        return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    },
+
+    _checkAutoCorrect (oHighlight) {
+        let { xNode, oErr } = oHighlight;
+        if (!xNode.id) {
+            return;
+        }
+        let sKey = "" + (this.nNextAutoCorrectKey++);
+        let oPending = { xNode, oHighlight, sWord: oErr.sValue, aSugg: [], nTimer: null };
+        this.oAutoCorrectPending.set(sKey, oPending);
+        oPending.nTimer = window.setTimeout(() => { this._finishAutoCorrect(sKey); }, 300);
+        oGrammalecteBackgroundPort.getSpellSuggestions(oErr.sValue, xNode.id, "autocorrect:" + sKey);
+    },
+
+    _onAutoCorrectSugg (sKey, oResult) {
+        let oPending = this.oAutoCorrectPending.get(sKey);
+        if (!oPending || oResult.sWord.toLowerCase() !== oPending.sWord.toLowerCase()) {
+            return;
+        }
+        oPending.aSugg.push(...oResult.aSugg);
+    },
+
+    _finishAutoCorrect (sKey) {
+        let oPending = this.oAutoCorrectPending.get(sKey);
+        if (!oPending) {
+            return;
+        }
+        this.oAutoCorrectPending.delete(sKey);
+        let { oHighlight, sWord, aSugg } = oPending;
+        // le surlignage a pu disparaître entre-temps (mot ignoré, texte modifié...)
+        if (!this._getState(oHighlight.xNode).aHighlights.includes(oHighlight)) {
+            return;
+        }
+        let sStripped = this._stripAccents(sWord).toLowerCase();
+        let aCandidates = [...new Set(aSugg)].filter((s) =>
+            s.toLowerCase() !== sWord.toLowerCase() && this._stripAccents(s).toLowerCase() === sStripped
+        );
+        if (aCandidates.length !== 1) {
+            return; // pas de certitude : on laisse le soulignage normal, l'utilisateur choisit
+        }
+        let xNode = oHighlight.xNode;
+        for (let xDiv of oHighlight.aDivs) {
+            xDiv.remove();
+        }
+        let oState = this._getState(xNode);
+        oState.aHighlights = oState.aHighlights.filter((h) => h !== oHighlight);
+        this._applyAutoCorrection(xNode, oHighlight.xRange, oHighlight.nStart, oHighlight.nEnd, aCandidates[0]);
+    },
+
+    _getSelectionNode () {
+        let xSel = window.getSelection();
+        return (xSel && xSel.rangeCount > 0) ? xSel.getRangeAt(0).startContainer : null;
+    },
+
+    _getGlobalCaretOffset (xNode, aCharMap) {
+        let xSel = window.getSelection();
+        if (!xSel || xSel.rangeCount === 0 || !xSel.isCollapsed) {
+            return -1;
+        }
+        let xRange = xSel.getRangeAt(0);
+        if (!xNode.contains(xRange.startContainer)) {
+            return -1;
+        }
+        for (let i = 0; i < aCharMap.length; i++) {
+            let o = aCharMap[i];
+            if (o && o.xTextNode === xRange.startContainer && o.iOffset === xRange.startOffset) {
+                return i;
+            }
+        }
+        // curseur juste après le dernier caractère d'un nœud texte
+        if (xRange.startContainer.nodeType === Node.TEXT_NODE && xRange.startOffset === xRange.startContainer.textContent.length) {
+            for (let i = aCharMap.length - 1; i >= 0; i--) {
+                if (aCharMap[i] && aCharMap[i].xTextNode === xRange.startContainer) {
+                    return i + 1;
+                }
+            }
+        }
+        return -1;
+    },
+
+    _setGlobalCaretOffset (xNode, aCharMap, nOffset) {
+        if (nOffset < 0) {
+            return;
+        }
+        let oTarget = null;
+        if (nOffset < aCharMap.length && aCharMap[nOffset]) {
+            oTarget = { xTextNode: aCharMap[nOffset].xTextNode, iOffset: aCharMap[nOffset].iOffset };
+        } else if (nOffset > 0 && aCharMap[nOffset - 1]) {
+            oTarget = { xTextNode: aCharMap[nOffset - 1].xTextNode, iOffset: aCharMap[nOffset - 1].iOffset + 1 };
+        }
+        if (!oTarget) {
+            return;
+        }
+        try {
+            let xRange = document.createRange();
+            xRange.setStart(oTarget.xTextNode, oTarget.iOffset);
+            xRange.collapse(true);
+            let xSel = window.getSelection();
+            xSel.removeAllRanges();
+            xSel.addRange(xRange);
+        }
+        catch (e) {
+            showError(e);
+        }
     },
 
     _colorFor (oErr, sKind) {
