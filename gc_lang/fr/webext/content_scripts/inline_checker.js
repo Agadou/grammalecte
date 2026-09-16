@@ -35,6 +35,18 @@
 */
 const TYPO_AUTOCORRECT_OPTIONS = new Set(["apos", "typo", "esp", "tab", "nbsp", "num", "unit", "liga"]);
 
+/*
+    En plus des catégories ci-dessus, quelques règles précises appartenant à
+    des catégories plus larges (donc pas incluses entièrement) sont assez
+    sûres pour être auto-corrigées : la majuscule en début de phrase (après
+    un point, ou en tout début de paragraphe) est déterministe et la règle
+    elle-même exclut déjà les cas ambigus (abréviations, énumérations...).
+    Le reste de la catégorie "maj" (ex. "la raison d'État") n'est PAS inclus :
+    risque de faux positifs sur des noms propres/communs ambigus selon le
+    contexte, contrairement à une majuscule de début de phrase.
+*/
+const TYPO_AUTOCORRECT_RULE_IDS = new Set(["majuscule_après_point", "majuscule_début_paragraphe"]);
+
 const oInlineChecker = {
 
     nNextId: 0,
@@ -220,7 +232,8 @@ const oInlineChecker = {
     // contrairement à l'orthographe, la suggestion est déjà fournie avec l'erreur,
     // pas besoin d'aller la chercher. Retourne true si la correction a été appliquée.
     _tryTypoAutoCorrect (xNode, nStart, nEnd, oErr) {
-        if (!TYPO_AUTOCORRECT_OPTIONS.has(oErr.sType) || !oErr.aSuggestions || oErr.aSuggestions.length !== 1) {
+        let bAllowed = TYPO_AUTOCORRECT_OPTIONS.has(oErr.sType) || TYPO_AUTOCORRECT_RULE_IDS.has(oErr.sRuleId);
+        if (!bAllowed || !oErr.aSuggestions || oErr.aSuggestions.length !== 1) {
             return false;
         }
         let xRange = this._buildRange(xNode, nStart, nEnd);
