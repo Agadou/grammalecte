@@ -53,6 +53,8 @@ class GrammalecteGrammarChecker extends GrammalectePanel {
     constructor (...args) {
         super(...args);
         this.aIgnoredErrors = new Set();
+        this.aIgnoredWords = new Set();
+        this._loadIgnoredWords();
         this.createMenu();
         this.xPanelContent.style.marginBottom = "6px";
         // Editor
@@ -233,6 +235,27 @@ class GrammalecteGrammarChecker extends GrammalectePanel {
             this.xParagraphList.removeChild(this.xParagraphList.firstChild);
         }
         this.aIgnoredErrors.clear();
+        // this.aIgnoredWords (persisted, word-based) survives clear(): it must stay active across analyses.
+    }
+
+    _loadIgnoredWords () {
+        // Mots dont l’utilisateur a demandé à ce qu’on arrête de les signaler (persistant, contrairement à aIgnoredErrors).
+        if (bChrome) {
+            browser.storage.local.get("ignored_words", this._setIgnoredWords.bind(this));
+        } else {
+            let xPromise = browser.storage.local.get("ignored_words");
+            xPromise.then(this._setIgnoredWords.bind(this), showError);
+        }
+    }
+
+    _setIgnoredWords (oResult) {
+        if (oResult.hasOwnProperty("ignored_words")) {
+            this.aIgnoredWords = new Set(oResult.ignored_words);
+        }
+    }
+
+    _saveIgnoredWords () {
+        browser.storage.local.set({"ignored_words": Array.from(this.aIgnoredWords)});
     }
 
     hide () {
@@ -385,7 +408,8 @@ class GrammalecteGrammarChecker extends GrammalectePanel {
         xNodeErr.dataset.error_id = oErr['sErrorId'];
         xNodeErr.dataset.ignored_key = oErr['sIgnoredKey'];
         xNodeErr.dataset.error_type = (oErr['sType'] === "WORD") ? "spelling" : "grammar";
-        if (this.aIgnoredErrors.has(xNodeErr.dataset.ignored_key)) {
+        if (this.aIgnoredErrors.has(xNodeErr.dataset.ignored_key)
+            || (xNodeErr.dataset.error_type === "spelling" && this.aIgnoredWords.has(sUnderlined.toLowerCase()))) {
             xNodeErr.className = "grammalecte_error_ignored";
         }
         else if (xNodeErr.dataset.error_type === "grammar") {
@@ -457,6 +481,11 @@ class GrammalecteGrammarChecker extends GrammalectePanel {
             let sErrorId = this.xParent.getElementById(sIgnoreButtonId).dataset.error_id;
             let xNodeErr = this.xParent.getElementById("grammalecte_err" + sErrorId);
             this.aIgnoredErrors.add(xNodeErr.dataset.ignored_key);
+            if (xNodeErr.dataset.error_type === "spelling") {
+                // Mot inconnu : on retient le mot lui-même (pas seulement cette occurrence), pour ne plus le signaler nulle part.
+                this.aIgnoredWords.add(xNodeErr.textContent.toLowerCase());
+                this._saveIgnoredWords();
+            }
             xNodeErr.className = "grammalecte_error_ignored";
             xNodeErr.removeAttribute("style");
             this.oTooltip.hide();
